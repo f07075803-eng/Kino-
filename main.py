@@ -1,5 +1,4 @@
 import logging
-import asyncio
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -11,16 +10,15 @@ import os
 # --- KONFIGURATSIYA ---
 API_TOKEN = '8599100876:AAGhk-U0gLCKNUAEf5Q1qThzsaAH-WHYmmA'
 ADMIN_ID = 7257755738
-CHANNELS = ['@SizningKanalingiz'] # Majburiy obuna kanallarini shu yerga yozing
 
-# Ma'lumotlarni saqlash (Vaqtinchalik, MongoDB ulanmaguncha)
-movies_db = {} 
-users_list = set()
+# Vaqtinchalik baza (Render o'chib yonsa tozalanadi, lekin hozir ishlashini ko'rasiz)
+movies_db = {}
+users_db = set()
 
 # --- SERVER ---
 app = Flask('')
 @app.route('/')
-def home(): return "Bot Faol!"
+def home(): return "Bot Active!"
 
 def run():
     port = int(os.environ.get("PORT", 8080))
@@ -29,15 +27,16 @@ def run():
 def keep_alive():
     Thread(target=run, daemon=True).start()
 
-# --- BOT ---
+# --- BOT SOZLAMALARI ---
 logging.basicConfig(level=logging.INFO)
+storage = MemoryStorage()
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
+dp = Dispatcher(bot, storage=storage)
 
-class AdminStates(StatesGroup):
-    waiting_for_movie = State()
+# Kino qo'shish bosqichlari
+class MovieState(StatesGroup):
+    waiting_for_video = State()
     waiting_for_code = State()
-    waiting_for_ad = State()
 
 # Tugmalar
 def admin_kb():
@@ -47,78 +46,52 @@ def admin_kb():
     kb.add("⬅️ Orqaga")
     return kb
 
-# Obunani tekshirish funksiyasi
-async def check_sub(user_id):
-    for channel in CHANNELS:
-        status = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-        if status.status == 'left':
-            return False
-    return True
-
 @dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    users_list.add(message.from_user.id)
+async def cmd_start(message: types.Message):
+    users_db.add(message.from_user.id)
     if message.from_user.id == ADMIN_ID:
-        await message.answer("Admin panel", reply_markup=admin_kb())
+        await message.answer("🛠 Admin paneliga xush kelibsiz!", reply_markup=admin_kb())
     else:
-        if await check_sub(message.from_user.id):
-            await message.answer("🍿 Kino kodini yuboring...")
-        else:
-            btn = types.InlineKeyboardMarkup()
-            for ch in CHANNELS:
-                btn.add(types.InlineKeyboardButton(text="Kanalga a'zo bo'lish", url=f"https://t.me/{ch[1:]}"))
-            btn.add(types.InlineKeyboardButton(text="Tekshirish ✅", callback_data="check"))
-            await message.answer("❌ Kino ko'rish uchun kanallarga a'zo bo'ling!", reply_markup=btn)
+        await message.answer("🍿 Salom! Kino kodini yuboring...")
 
-# Kino qo'shish jarayoni
+# --- KINO QO'SHISH FUNKSIYASI ---
+
 @dp.message_handler(lambda m: m.text == "🎬 Kino qo'shish", user_id=ADMIN_ID)
-async def add_movie_start(message: types.Message):
-    await AdminStates.waiting_for_movie.set()
-    await message.answer("Videoni yuboring...")
+async def start_add(message: types.Message):
+    await MovieState.waiting_for_video.set()
+    await message.answer("🎬 Menga videoni (kino) yuboring...")
 
-@dp.message_handler(content_types=['video'], state=AdminStates.waiting_for_movie)
+@dp.message_handler(content_types=['video'], state=MovieState.waiting_for_video)
 async def get_video(message: types.Message, state: FSMContext):
-    await state.update_data(file_id=message.video.file_id)
-    await AdminStates.waiting_for_code.set()
-    await message.answer("Kino uchun kod yozing:")
+    await state.update_data(vid_id=message.video.file_id)
+    await MovieState.waiting_for_code.set()
+    await message.answer("✅ Video qabul qilindi. Endi bu kino uchun **KOD** yuboring (masalan: 101):")
 
-@dp.message_handler(state=AdminStates.waiting_for_code)
+@dp.message_handler(state=MovieState.waiting_for_code)
 async def get_code(message: types.Message, state: FSMContext):
+    code = message.text
     data = await state.get_data()
-    movies_db[message.text] = data['file_id']
+    movies_db[code] = data['vid_id'] # Bazaga saqlash
     await state.finish()
-    await message.answer(f"✅ Saqlandi! Kod: {message.text}", reply_markup=admin_kb())
+    await message.answer(f"🚀 Tayyor! Endi kim botga `{code}` deb yozsa, ushbu kino yuboriladi.", reply_markup=admin_kb())
 
-# Xabar yuborish (Reklama)
-@dp.message_handler(lambda m: m.text == "✉️ Xabar yuborish", user_id=ADMIN_ID)
-async def send_ad_start(message: types.Message):
-    await AdminStates.waiting_for_ad.set()
-    await message.answer("Reklama xabarini yuboring (rasm, matn, video)...")
+# --- STATISTIKA ---
+@dp.message_handler(lambda m: m.text == "📊 Statistika", user_id=ADMIN_ID)
+async def show_stats(message: types.Message):
+    await message.answer(f"📊 Statistika:\n👤 Foydalanuvchilar: {len(users_db)}\n🎬 Kinolar: {len(movies_db)}")
 
-@dp.message_handler(state=AdminStates.waiting_for_ad, content_types=types.ContentTypes.ANY)
-async def start_broadcasting(message: types.Message, state: FSMContext):
-    count = 0
-    for user in users_list:
-        try:
-            await message.copy_to(user)
-            count += 1
-        except: pass
-    await state.finish()
-    await message.answer(f"✅ Reklama {count} kishiga yuborildi.")
-
-# Kino qidirish
+# --- KINO QIDIRISH (HAMMA UCHUN) ---
 @dp.message_handler()
 async def search(message: types.Message):
-    if message.text in movies_db:
-        if await check_sub(message.from_user.id):
-            await bot.send_video(message.chat.id, movies_db[message.text])
-        else:
-            await message.answer("Avval kanallarga a'zo bo'ling!")
+    code = message.text
+    if code in movies_db:
+        await bot.send_video(message.chat.id, movies_db[code], caption=f"🎬 Kod: {code}")
+    elif message.from_user.id == ADMIN_ID:
+        pass # Admin tugmalari uchun
     else:
-        if message.from_user.id != ADMIN_ID:
-            await message.answer("Kino topilmadi ❌")
+        await message.answer("❌ Bunday kodli kino topilmadi.")
 
 if __name__ == '__main__':
     keep_alive()
     executor.start_polling(dp, skip_updates=True)
-            
+    
