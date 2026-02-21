@@ -1,97 +1,88 @@
 import logging
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from flask import Flask
-from threading import Thread
-import os
 
 # --- KONFIGURATSIYA ---
 API_TOKEN = '8599100876:AAGhk-U0gLCKNUAEf5Q1qThzsaAH-WHYmmA'
 ADMIN_ID = 7257755738
+CHANNELS = ["@u_uz_channel"]  # Majburiy a'zolik uchun kanallar (userneymini yozing)
 
-# Vaqtinchalik baza (Render o'chib yonsa tozalanadi, lekin hozir ishlashini ko'rasiz)
-movies_db = {}
-users_db = set()
-
-# --- SERVER ---
-app = Flask('')
-@app.route('/')
-def home(): return "Bot Active!"
-
-def run():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    Thread(target=run, daemon=True).start()
-
-# --- BOT SOZLAMALARI ---
 logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN, parse_mode=types.ParseMode.HTML)
 storage = MemoryStorage()
-bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
-# Kino qo'shish bosqichlari
-class MovieState(StatesGroup):
-    waiting_for_video = State()
-    waiting_for_code = State()
+# Ma'lumotlar bazasi o'rniga oddiy lug'at (Real loyihada SQLite yoki MongoDB yaxshiroq)
+movies_db = {
+    "101": {"name": "O'rgimchak odam", "link": "https://t.me/your_channel/1"},
+    "102": {"name": "Qasoskorlar", "link": "https://t.me/your_channel/2"},
+}
 
-# Tugmalar
-def admin_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📊 Statistika", "✉️ Xabar yuborish")
-    kb.row("🎬 Kino qo'shish", "🔐 Kanallar")
-    kb.add("⬅️ Orqaga")
-    return kb
+class AdminStates(StatesGroup):
+    waiting_for_movie_data = State()
+
+# --- FUNKSIYALAR ---
+async def check_sub(user_id):
+    """Kanallarga a'zolikni tekshirish"""
+    for channel in CHANNELS:
+        chat_member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        if chat_member.status == 'left':
+            return False
+    return True
+
+# --- HANDLERLAR ---
 
 @dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    users_db.add(message.from_user.id)
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("🛠 Admin paneliga xush kelibsiz!", reply_markup=admin_kb())
+async def send_welcome(message: types.Message):
+    is_sub = await check_sub(message.from_user.id)
+    if is_sub:
+        await message.answer(f"Xush kelibsiz, {message.from_user.full_name}!\n"
+                             f"Kino kodini kiriting:")
     else:
-        await message.answer("🍿 Salom! Kino kodini yuboring...")
+        btn = types.InlineKeyboardMarkup()
+        for ch in CHANNELS:
+            btn.add(types.InlineKeyboardButton(text="Kanalga o'tish", url=f"https://t.me/{ch[1:]}"))
+        btn.add(types.InlineKeyboardButton(text="Tekshirish", callback_data="check"))
+        await message.answer("Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=btn)
 
-# --- KINO QO'SHISH FUNKSIYASI ---
+@dp.callback_query_handler(text="check")
+async def check_callback(call: types.CallbackQuery):
+    if await check_sub(call.from_user.id):
+        await call.message.delete()
+        await call.message.answer("Rahmat! Endi kino kodini yuborishingiz mumkin.")
+    else:
+        await call.answer("Hali a'zo emassiz!", show_alert=True)
 
-@dp.message_handler(lambda m: m.text == "🎬 Kino qo'shish", user_id=ADMIN_ID)
-async def start_add(message: types.Message):
-    await MovieState.waiting_for_video.set()
-    await message.answer("🎬 Menga videoni (kino) yuboring...")
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Admin xush kelibsiz! Yangi kino qo'shish uchun format:\n"
+                             "<code>kod|nomi|link</code> ko'rinishida yozing.")
+        await AdminStates.waiting_for_movie_data.set()
 
-@dp.message_handler(content_types=['video'], state=MovieState.waiting_for_video)
-async def get_video(message: types.Message, state: FSMContext):
-    await state.update_data(vid_id=message.video.file_id)
-    await MovieState.waiting_for_code.set()
-    await message.answer("✅ Video qabul qilindi. Endi bu kino uchun **KOD** yuboring (masalan: 101):")
-
-@dp.message_handler(state=MovieState.waiting_for_code)
-async def get_code(message: types.Message, state: FSMContext):
-    code = message.text
-    data = await state.get_data()
-    movies_db[code] = data['vid_id'] # Bazaga saqlash
+@dp.message_handler(state=AdminStates.waiting_for_movie_data)
+async def add_movie(message: types.Message, state: FSMContext):
+    try:
+        data = message.text.split('|')
+        movies_db[data[0]] = {"name": data[1], "link": data[2]}
+        await message.answer(f"Kino saqlandi: {data[1]}")
+    except:
+        await message.answer("Xato! Format: kod|nomi|link")
     await state.finish()
-    await message.answer(f"🚀 Tayyor! Endi kim botga `{code}` deb yozsa, ushbu kino yuboriladi.", reply_markup=admin_kb())
 
-# --- STATISTIKA ---
-@dp.message_handler(lambda m: m.text == "📊 Statistika", user_id=ADMIN_ID)
-async def show_stats(message: types.Message):
-    await message.answer(f"📊 Statistika:\n👤 Foydalanuvchilar: {len(users_db)}\n🎬 Kinolar: {len(movies_db)}")
-
-# --- KINO QIDIRISH (HAMMA UCHUN) ---
 @dp.message_handler()
-async def search(message: types.Message):
+async def search_movie(message: types.Message):
     code = message.text
     if code in movies_db:
-        await bot.send_video(message.chat.id, movies_db[code], caption=f"🎬 Kod: {code}")
-    elif message.from_user.id == ADMIN_ID:
-        pass # Admin tugmalari uchun
+        movie = movies_db[code]
+        await message.answer(f"🎬 <b>Nomi:</b> {movie['name']}\n\n"
+                             f"📥 <b>Yuklab olish:</b> {movie['link']}")
     else:
-        await message.answer("❌ Bunday kodli kino topilmadi.")
+        await message.answer("Afsuski, bu kod bilan hech qanday kino topilmadi. 😔")
 
 if __name__ == '__main__':
-    keep_alive()
     executor.start_polling(dp, skip_updates=True)
     
